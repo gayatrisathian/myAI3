@@ -1,46 +1,32 @@
-// app/api/chat/tools/web-search.ts
-/**
- * Minimal, runtime-exported webSearch function.
- * Uses dynamic import of exa-js so this module is a tiny ES module at compile-time.
- * Returns an array of { title, url, content, publishedDate } as before.
- */
+import { tool } from 'ai';
+import { z } from 'zod';
+import Exa from 'exa-js';
 
-export type WebSearchResult = {
-  title: string;
-  url?: string;
-  content?: string;
-  publishedDate?: string | null;
-};
+const exa = new Exa(process.env.EXA_API_KEY);
 
-export async function webSearch(query: string, opts?: { numResults?: number }): Promise<WebSearchResult[]> {
-  try {
-    // dynamic import to avoid top-level side-effects / build-time issues
-    const ExaModule = await import("exa-js");
-    // exa-js may export default or named export; handle both
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const Exa: any = ExaModule?.default ?? ExaModule;
+export const webSearch = tool({
+  description: 'Search the web for up-to-date information',
+  inputSchema: z.object({
+    query: z.string().min(1).describe('The search query'),
+  }),
+  execute: async ({ query }) => {
+    try {
+      const { results } = await exa.search(query, {
+        contents: {
+          text: true,
+        },
+        numResults: 3,
+      });
 
-    const exa = new Exa(process.env.EXA_API_KEY);
-
-    const numResults = opts?.numResults ?? 3;
-
-    const { results } = await exa.search(query, {
-      contents: {
-        text: true,
-      },
-      numResults,
-    });
-
-    return (results || []).map((result: any) => ({
-      title: result.title,
-      url: result.url,
-      content: result.text?.slice(0, 1000) || "",
-      publishedDate: result.publishedDate ?? null,
-    }));
-  } catch (error) {
-    // keep errors non-fatal for the route
-    // eslint-disable-next-line no-console
-    console.error("webSearch error:", error);
-    return [];
-  }
-}
+      return results.map(result => ({
+        title: result.title,
+        url: result.url,
+        content: result.text?.slice(0, 1000) || '',
+        publishedDate: result.publishedDate,
+      }));
+    } catch (error) {
+      console.error('Error searching the web:', error);
+      return [];
+    }
+  },
+});
