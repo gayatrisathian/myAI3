@@ -1,4 +1,4 @@
-// app/api/chat/route.ts
+f// app/api/chat/route.ts
 import { NextResponse } from "next/server";
 
 /**
@@ -78,23 +78,68 @@ export async function POST(req: Request) {
       }
     }
 
-    const result = streamText({
-      model: MODEL,
-      system: SYSTEM_PROMPT,
-      messages: convertToModelMessages(messages),
-      tools: {
-        webSearch,
-        vectorDatabaseSearch,
-      },
-      stopWhen: stepCountIs(10),
-      providerOptions: {
-        openai: {
-          reasoningSummary: "auto",
-          reasoningEffort: "low",
-          parallelToolCalls: false,
-        },
-      },
-    });
+    // --- wrap plain functions into Tool-like objects (replace the old streamText(...) call) ---
+
+// helper to normalise either a function or a Tool-like object into a Tool-like object
+function makeToolLike(maybeTool: any) {
+  if (!maybeTool) return undefined;
+  // if it's already an object with execute, assume it's a Tool-like object
+  if (typeof maybeTool === "object" && typeof maybeTool.execute === "function") {
+    return maybeTool;
+  }
+  // if it's a function, wrap it into { execute: async (input) => ... }
+  if (typeof maybeTool === "function") {
+    return {
+      execute: async (input: any) => {
+        // support two common calling shapes:
+        // - execute({ query: "..." , ... })
+        // - execute("...") or underlying function(query, opts?)
+        const query = input && (input.query ?? input) ?? "";
+        // pass whole input as opts too so underlying function may use numResults / k etc.
+        try {
+          return await maybeTool(query, input);
+        } catch (err) {
+          // keep failures non-fatal for streamText — log and return empty
+          // eslint-disable-next-line no-console
+          console.error("Tool wrapper execute() error:", err);
+          return [];
+        }
+      }
+    };
+  }
+  // otherwise just return as-is
+  return maybeTool;
+}
+
+// normalize whatever you imported as webSearch / vectorDatabaseSearch
+// (cover both cases: you have `webSearch` variables or `webSearchModule` objects)
+const rawWebSearch = typeof webSearch !== "undefined" ? webSearch
+  : (typeof webSearchModule !== "undefined" ? (webSearchModule?.webSearch ?? webSearchModule?.default ?? webSearchModule) : undefined);
+
+const rawVectorSearch = typeof vectorDatabaseSearch !== "undefined" ? vectorDatabaseSearch
+  : (typeof vectorDBModule !== "undefined" ? (vectorDBModule?.vectorDatabaseSearch ?? vectorDBModule?.default ?? vectorDBModule) : undefined);
+
+const webSearchToolLike = makeToolLike(rawWebSearch);
+const vectorDatabaseSearchToolLike = makeToolLike(rawVectorSearch);
+
+// now call streamText with tool-like objects
+const result = streamText({
+  model: MODEL,
+  system: SYSTEM_PROMPT,
+  messages: convertToModelMessages(messages),
+  tools: {
+    webSearch: webSearchToolLike,
+    vectorDatabaseSearch: vectorDatabaseSearchToolLike,
+  },
+  stopWhen: stepCountIs(10),
+  providerOptions: {
+    openai: {
+      reasoningSummary: "auto",
+      reasoningEffort: "low",
+      parallelToolCalls: false,
+    },
+  },
+});
 
     return result.toUIMessageStreamResponse({
       sendReasoning: true,
