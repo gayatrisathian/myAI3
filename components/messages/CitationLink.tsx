@@ -12,7 +12,7 @@ export default function CitationLink({ url, label, className, download }: Props)
   if (!url) return null;
 
   const handleClick: React.MouseEventHandler<HTMLAnchorElement> = (e) => {
-    // prevent parent container (message card) from hijacking the click
+    // Prevent parent containers (message card) from hijacking the click
     e.stopPropagation();
   };
 
