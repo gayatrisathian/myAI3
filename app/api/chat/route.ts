@@ -11,15 +11,14 @@ import {
 import { MODEL } from "@/config";
 import { SYSTEM_PROMPT } from "@/prompts";
 import { isContentFlagged } from "@/lib/moderation";
-// NOTE: vectorDatabaseSearch should be exported from ./tools/search-vector-database
-// either as a `tool({...})` (with .execute) or a normal function.
 import { vectorDatabaseSearch } from "./tools/search-vector-database";
 
 export const maxDuration = 30;
 
-/**
- * Normalize many possible shapes returned by vectorDatabaseSearch (tool or function)
- */
+/* -------------------------
+   Helpers
+   ------------------------- */
+
 function normalizeMatches(resp: any): any[] {
   if (!resp) return [];
   if (Array.isArray(resp)) return resp;
@@ -33,42 +32,31 @@ function normalizeMatches(resp: any): any[] {
 }
 
 /**
- * Run the vector DB probe in a way that supports:
- * - a "tool" export with .execute({ query, ...opts })
- * - or a plain function export vectorDatabaseSearch(query, opts)
+ * Call a tool that may be exported as ai.tool (with .execute) or plain function.
  */
 async function runVectorProbe(query: string, opts?: { k?: number; namespace?: string | undefined }) {
   const maybeTool: any = vectorDatabaseSearch;
+  if (!maybeTool) return [];
   try {
-    if (!maybeTool) {
-      return [];
-    }
     if (typeof maybeTool.execute === "function") {
-      // `tool({ ... })` shape from 'ai' package
       const res = await maybeTool.execute({ query, ...(opts ?? {}) });
       return normalizeMatches(res);
     } else if (typeof maybeTool === "function") {
-      // plain function export
       const res = await maybeTool(query, opts ?? {});
       return normalizeMatches(res);
     } else {
-      console.warn("vectorDatabaseSearch export is not callable nor a tool object.");
+      console.warn("vectorDatabaseSearch is not callable nor a tool object.");
       return [];
     }
   } catch (err) {
-    console.error("Error running vector probe:", err);
-    // bubble up for caller to handle; we return empty to keep flow stable
+    console.error("runVectorProbe error:", err);
     return [];
   }
 }
 
-/**
- * Build a short human-readable summary of the top probe matches
- * to include in system prompt (helps the model cite sources).
- */
 function buildSourceSummary(matches: any[], maxEntries = 5) {
   if (!Array.isArray(matches) || matches.length === 0) return "";
-  const lines = ["Sources retrieved from vector DB:"];
+  const lines: string[] = ["Sources retrieved from vector DB:"];
   for (let i = 0; i < Math.min(matches.length, maxEntries); i++) {
     const m = matches[i];
     const name = (m?.metadata?.source_name ?? m?.source_name ?? m?.metadata?.title) || `Source ${i + 1}`;
@@ -79,18 +67,37 @@ function buildSourceSummary(matches: any[], maxEntries = 5) {
   return lines.join("\n");
 }
 
-/**
- * POST handler — streaming response using streamText
- */
+/* -------------------------
+   Route
+   ------------------------- */
+
 export async function POST(req: Request) {
   try {
-    const { messages }: { messages: UIMessage[] } = await req.json();
+    // Support debug mode via query param: ?debug=json
+    const url = new URL(req.url);
+    const debugJson = url.searchParams.get("debug") === "json";
+
+    const body = await req.json().catch((e) => {
+      console.error("Invalid JSON request body:", e);
+      if (debugJson) {
+        return { messages: [] };
+      }
+      throw new Error("Invalid JSON body");
+    });
+
+    const { messages }: { messages: UIMessage[] } = body ?? { messages: [] };
 
     if (!Array.isArray(messages) || messages.length === 0) {
+      if (debugJson) {
+        return new Response(JSON.stringify({ probeMatches: [], sourceSummary: "", debug: "no messages" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       return new Response(JSON.stringify({ error: "Missing messages" }), { status: 400 });
     }
 
-    // Find latest user message text (concatenate its text parts)
+    // latest user text
     const latestUserMessage = messages.filter((m) => m.role === "user").pop();
     const userText = latestUserMessage
       ? (latestUserMessage.parts ?? [])
@@ -100,7 +107,12 @@ export async function POST(req: Request) {
       : "";
 
     if (!userText || userText.trim() === "") {
-      // No user text — return a short streaming denial
+      if (debugJson) {
+        return new Response(JSON.stringify({ probeMatches: [], sourceSummary: "", debug: "no user text found" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       const stream = createUIMessageStream({
         execute({ writer }) {
           const id = "no-user-text";
@@ -114,12 +126,22 @@ export async function POST(req: Request) {
       return createUIMessageStreamResponse({ stream });
     }
 
-    // Moderation check
+    // moderation
     try {
-      const moderationResult = await isContentFlagged(userText);
-      if (moderationResult?.flagged) {
-        // stream a moderation denial response
-        const denial = moderationResult.denialMessage || "Your message violates our guidelines. I can't answer that.";
+      const mod = await isContentFlagged(userText);
+      if (mod?.flagged) {
+        if (debugJson) {
+          return new Response(
+            JSON.stringify({
+              probeMatches: [],
+              sourceSummary: "",
+              debug: "message flagged by moderation",
+              denialMessage: mod.denialMessage,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        const denial = mod.denialMessage ?? "Your message violates our guidelines. I can't answer that.";
         const stream = createUIMessageStream({
           execute({ writer }) {
             const id = "moderation-denial";
@@ -133,33 +155,53 @@ export async function POST(req: Request) {
         return createUIMessageStreamResponse({ stream });
       }
     } catch (merr) {
-      // moderation failed — log but continue (don't block user)
-      console.error("Moderation check error:", merr);
+      console.error("Moderation error:", merr);
+      // continue
     }
 
-    // Probe Pinecone / vector DB for top matches
-    let probeMatches: any[] = [];
-    try {
-      probeMatches = await runVectorProbe(userText, { k: 5, namespace: undefined });
-      // log basic info for debugging
-      console.info(`Vector probe returned ${Array.isArray(probeMatches) ? probeMatches.length : 0} matches`);
-    } catch (probeErr) {
-      console.error("Probe error (caught in POST):", probeErr);
-      probeMatches = [];
-    }
+    // Probe Pinecone (vector DB)
+    const probeMatches = await runVectorProbe(userText, { k: 5, namespace: undefined });
+    console.info(`runVectorProbe returned ${Array.isArray(probeMatches) ? probeMatches.length : 0} matches`);
 
-    // Build a source summary to inject into the system prompt (so model can reference sources)
+    // Debug return of raw matches + summary (no LLM) if requested
     const sourceSummary = buildSourceSummary(probeMatches, 5);
+    if (debugJson) {
+      // Return raw probeMatches so you can inspect them directly
+      return new Response(
+        JSON.stringify({
+          probeMatches,
+          sourceSummary,
+          debug: "raw vector probe output",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // If no matches found, stream a short "no documents" message (do not call web search)
+    if (!probeMatches || probeMatches.length === 0) {
+      console.info("No pinecone matches found for query — streaming 'no documents found' to client.");
+      const stream = createUIMessageStream({
+        execute({ writer }) {
+          const id = "no-docs";
+          writer.write({ type: "start" });
+          writer.write({ type: "text-start", id });
+          writer.write({ type: "text-delta", id, delta: "I couldn't find relevant documents in the knowledge base. Please upload the document or try a different query." });
+          writer.write({ type: "text-end", id });
+          writer.write({ type: "finish" });
+        },
+      });
+      return createUIMessageStreamResponse({ stream });
+    }
+
+    // Build system prompt augmented with source summary from Pinecone
     const systemPromptWithSources = sourceSummary ? `${SYSTEM_PROMPT}\n\n${sourceSummary}` : SYSTEM_PROMPT;
 
-    // Now start streaming the assistant reply using streamText.
-    // Provide only the vectorDatabaseSearch tool — model can call it if needed.
+    // Stream using streamText — expose vectorDatabaseSearch as a tool so model can re-query if it wants
     const result = streamText({
       model: MODEL,
       system: systemPromptWithSources,
       messages: convertToModelMessages(messages),
       tools: {
-        // include vector db tool so model can invoke it during generation (if desired)
         vectorDatabaseSearch,
       },
       stopWhen: stepCountIs(10),
@@ -172,29 +214,21 @@ export async function POST(req: Request) {
       },
     });
 
-    // Return the streaming UI response (same shape your UI expects)
     return result.toUIMessageStreamResponse({
       sendReasoning: true,
     });
   } catch (err: any) {
     console.error("Unhandled /api/chat error:", err);
-
-    // If something fatal happened, return a small streaming error payload so UI still gets a stream
     const stream = createUIMessageStream({
       execute({ writer }) {
         const id = "internal-error";
         writer.write({ type: "start" });
         writer.write({ type: "text-start", id });
-        writer.write({
-          type: "text-delta",
-          id,
-          delta: `Server error: ${(err as any)?.message ?? String(err)}.`,
-        });
+        writer.write({ type: "text-delta", id, delta: `Server error: ${(err as any)?.message ?? String(err)}.` });
         writer.write({ type: "text-end", id });
         writer.write({ type: "finish" });
       },
     });
-
     return createUIMessageStreamResponse({ stream });
   }
 }
