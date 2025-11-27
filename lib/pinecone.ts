@@ -1,63 +1,33 @@
-// lib/pinecone.ts  (OpenAI embedder variant)
-import { PineconeClient } from "@pinecone-database/pinecone";
-import OpenAI from "openai";
+import { Pinecone } from '@pinecone-database/pinecone';
+import { PINECONE_TOP_K } from '@/config';
+import { searchResultsToChunks, getSourcesFromChunks, getContextFromSources } from '@/lib/sources';
+import { PINECONE_INDEX_NAME } from '@/config';
 
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY || "";
-const PINECONE_ENV = process.env.PINECONE_ENV || "";
-const PINECONE_INDEX = process.env.PINECONE_INDEX_NAME || process.env.PINECONE_INDEX || "my-ai";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-
-let pineconeClient: PineconeClient | null = null;
-function getClient() {
-  if (pineconeClient) return pineconeClient;
-  if (!PINECONE_API_KEY) throw new Error("Missing PINECONE_API_KEY");
-  pineconeClient = new PineconeClient();
-  pineconeClient.init({
-    apiKey: PINECONE_API_KEY,
-    environment: PINECONE_ENV,
-  });
-  return pineconeClient;
+if (!process.env.PINECONE_API_KEY) {
+    throw new Error('PINECONE_API_KEY is not set');
 }
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+export const pinecone = new Pinecone({
+    apiKey: process.env.PINECONE_API_KEY,
+});
 
-export async function searchPinecone(query: string, opts?: { topK?: number; namespace?: string }) {
-  if (!OPENAI_API_KEY) {
-    console.warn("OPENAI_API_KEY missing; cannot create query embeddings");
-    return [];
-  }
+export const pineconeIndex = pinecone.Index(PINECONE_INDEX_NAME);
 
-  const topK = opts?.topK ?? 5;
-  const namespace = opts?.namespace;
-
-  try {
-    // Create an embedding for the query using OpenAI
-    const embResp = await openai.embeddings.create({
-      model: "text-embedding-3-small", // pick embed model that matches your index dims
-      input: query,
-    });
-    const vector = embResp.data[0].embedding as number[];
-
-    const client = getClient();
-    const index = client.Index(PINECONE_INDEX);
-
-    const queryResponse = await index.query({
-      vector,
-      topK,
-      includeMetadata: true,
-      namespace,
+export async function searchPinecone(
+    query: string,
+): Promise<string> {
+    const results = await pineconeIndex.namespace('default').searchRecords({
+        query: {
+            inputs: {
+                text: query,
+            },
+            topK: PINECONE_TOP_K,
+        },
+        fields: ['text', 'pre_context', 'post_context', 'source_url', 'source_description', 'source_type', 'order'],
     });
 
-    const matches = (queryResponse.matches ?? []).map((m: any) => ({
-      id: m.id,
-      score: m.score,
-      metadata: m.metadata ?? {},
-      text: (m.metadata?.text ?? m.metadata?.chunk ?? "") as string,
-    }));
-
-    return matches;
-  } catch (err) {
-    console.error("searchPinecone (openai) error:", err);
-    return [];
-  }
+    const chunks = searchResultsToChunks(results);
+    const sources = getSourcesFromChunks(chunks);
+    const context = getContextFromSources(sources);
+    return `< results > ${context} </results>`;
 }
