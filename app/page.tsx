@@ -240,7 +240,6 @@ export default function Chat() {
           <div className="w-full px-5 py-3 items-center flex justify-center text-xs text-muted-foreground">
             © {new Date().getFullYear()} FirstName LastName&nbsp;
             <Link href="/terms" className="underline">Terms of Use</Link>&nbsp;Powered by&nbsp;
-            <Link href="https://ringel.ai/" className="underline">Ringel.AI</Link>
           </div>
         </div>
       </main>
