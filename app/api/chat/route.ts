@@ -214,7 +214,7 @@ export async function POST(req: Request) {
       }
     } catch (assistantErr) {
       console.error("Assistant call failed:", assistantErr);
-      assistantText = "Assistant error: " + (assistantErr?.message ?? String(assistantErr));
+      assistantText = "Assistant error: " + ((assistantErr as any)?.message ?? String(assistantErr));
     }
 
     // Return structured response
